@@ -1,13 +1,15 @@
 import os
 import sounddevice as sd
-import numpy as np
 import wave
-import pyttsx3
+import torch
 from faster_whisper import WhisperModel
-from collections import deque
-import time
+from TTS.api import TTS
 
-# For LLaMA local inference
+# -----------------------------
+# 🧠 Suppress LLaMA Logs
+# -----------------------------
+os.environ["LLAMA_CPP_LOG_LEVEL"] = "error"  # hide perf logs
+
 try:
     from llama_cpp import Llama
 except ImportError:
@@ -15,112 +17,119 @@ except ImportError:
     os.system("pip install llama-cpp-python")
     from llama_cpp import Llama
 
-# ------------------------------
-# 🎤 Audio Settings
-# ------------------------------
-MIC_DEVICE_INDEX = 10  # Change to your mic index
+# -----------------------------
+# LLaMA Model Setup
+# -----------------------------
+MODEL_NAME = "llama-2-7b-chat.Q4_K_M.gguf"
+MODEL_PATH = f"models/{MODEL_NAME}"
+
+if not os.path.exists(MODEL_PATH):
+    print(f"⬇ Downloading LLaMA 2 7B model ({MODEL_NAME})...")
+    os.makedirs("models", exist_ok=True)
+    hf_token = os.getenv("HF_TOKEN", "my hf_ token")
+    download_cmd = f"curl -L -H 'Authorization: Bearer {hf_token}' -o {MODEL_PATH} " \
+                   f"https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF-f16/resolve/main/{MODEL_NAME}"
+    os.system(download_cmd)
+
+print("🔧 Initializing LLaMA model...")
+try:
+    llm = Llama(model_path=MODEL_PATH, n_threads=8, n_gpu_layers=32, gpu_index=0)
+except Exception as e:
+    print(f"⚠ GPU load failed, falling back to CPU: {e}")
+    llm = Llama(model_path=MODEL_PATH, n_threads=8)
+
+# -----------------------------
+# Audio Input Configuration
+# -----------------------------
+def get_input_device():
+    for i, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0:
+            return i
+    raise RuntimeError("No input device found")
+
+try:
+    MIC_DEVICE_INDEX = 10
+    SAMPLE_RATE = int(sd.query_devices(MIC_DEVICE_INDEX, 'input')['default_samplerate'])
+except ValueError:
+    MIC_DEVICE_INDEX = get_input_device()
+    SAMPLE_RATE = int(sd.query_devices(MIC_DEVICE_INDEX, 'input')['default_samplerate'])
+
 CHANNELS = 1
-SAMPLE_RATE = 44100
-AUDIO_QUEUE = deque()
 FILENAME = "input.wav"
-SILENCE_THRESHOLD = 500  # Adjust as needed
-SILENCE_DURATION = 5  # seconds to stop recording after silence
+print(f"🎤 Using mic: {sd.query_devices(MIC_DEVICE_INDEX)['name']} ({MIC_DEVICE_INDEX}) at {SAMPLE_RATE} Hz")
 
-device_info = sd.query_devices(MIC_DEVICE_INDEX, 'input')
-SAMPLE_RATE = int(device_info['default_samplerate'])
-print(f"🎤 Using device: {device_info['name']} ({MIC_DEVICE_INDEX}) at {SAMPLE_RATE} Hz")
+# -----------------------------
+# Text-to-Speech (TTS) Setup
+# -----------------------------
+tts = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=torch.cuda.is_available())
 
-# ------------------------------
-# 🧠 Initialize Faster Whisper
-# ------------------------------
-whisper_model = WhisperModel("medium.en", device="cuda")  # Or "cpu"
+def speak(text):
+    tts.tts_to_file(text=text, file_path="ai_speech.wav")
+    # play audio using sounddevice
+    import soundfile as sf
+    data, fs = sf.read("ai_speech.wav", dtype='float32')
+    sd.play(data, fs)
+    sd.wait()
 
-def record_audio(filename=FILENAME, silence_duration=SILENCE_DURATION):
-    print("🎙️ Speak now... (5s silence will stop recording)")
-    buffer = []
-    start_time = time.time()
-    silence_start = None
+# -----------------------------
+# Whisper Setup
+# -----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🧠 Loading Whisper model on {device}...")
+whisper_model = WhisperModel("large-v3", device=device, compute_type="float16" if device=="cuda" else "default")
 
-    def callback(indata, frames, time_info, status):
-        nonlocal silence_start
-        buffer.append(indata.copy())
-        volume_norm = np.linalg.norm(indata) * 10
-        if volume_norm < SILENCE_THRESHOLD:
-            if silence_start is None:
-                silence_start = time.time()
-        else:
-            silence_start = None
-
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
-                        dtype='int16', device=MIC_DEVICE_INDEX,
-                        callback=callback):
-        while True:
-            sd.sleep(100)
-            if silence_start and (time.time() - silence_start) > silence_duration:
-                break
-
-    audio = np.concatenate(buffer)
+# -----------------------------
+# Record Audio
+# -----------------------------
+def record_audio(filename=FILENAME, duration=3):
+    print(f"🎙 Recording for {duration} seconds...")
+    audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=CHANNELS,
+                   dtype='int16', device=MIC_DEVICE_INDEX)
+    sd.wait()
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio.tobytes())
-
     return filename
 
+# -----------------------------
+# Speech-to-Text
+# -----------------------------
 def transcribe_audio(filename):
-    print("🔍 Transcribing...")
-    segments, _ = whisper_model.transcribe(filename)
-    text = " ".join([seg.text for seg in segments]).strip()
-    print(f"🗣️ You said: {text}")
-    return text
+    segments, _ = whisper_model.transcribe(filename, language="en")
+    return " ".join([seg.text for seg in segments]).strip()
 
-# ------------------------------
-# 🤖 LLaMA Local Response
-# ------------------------------
-MODEL_PATH = "models/llama-2-7b-chat.Q4_K_M.gguf"
-if not os.path.exists(MODEL_PATH):
-    print("⬇ Downloading LLaMA 2 7B model locally...")
-    os.makedirs("models", exist_ok=True)
-    # Replace with correct GGUF URL
-    os.system(f"wget -O {MODEL_PATH} https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf")
-
-llm = Llama(model_path=MODEL_PATH, n_threads=8)
-
-def get_ai_response(prompt):
-    print("🤖 Thinking locally with LLaMA...")
+# -----------------------------
+# Get AI Response
+# -----------------------------
+def get_ai_response(user_text):
+    prompt = f"You are a helpful AI assistant. The user said: {user_text}"
     response = llm(prompt, max_tokens=256)
-    reply = response['choices'][0]['text'].strip()
-    print(f"🤖 AI: {reply}")
-    return reply
+    return response["choices"][0]["text"].strip()
 
-# ------------------------------
-# 🔊 Text-to-Speech
-# ------------------------------
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 180)
-
-def speak_text(text):
-    tts_engine.say(text)
-    tts_engine.runAndWait()
-
-# ------------------------------
-# 🔁 Main Voice Chat Loop
-# ------------------------------
-def voice_chat_loop():
-    print("🧠 Voice Chat Ready (say 'exit' to quit)\n")
+# -----------------------------
+# Voice Assistant Loop
+# -----------------------------
+def voice_assistant():
+    print("🧠 Voice Assistant Ready! (say 'exit' to quit)\n")
     while True:
         try:
-            audio_file = record_audio()
+            audio_file = record_audio(duration=5)
             user_text = transcribe_audio(audio_file)
+
             if not user_text:
                 continue
+
+            print(f"🗣 You: {user_text}")
+
             if "exit" in user_text.lower():
-                print("👋 Goodbye!")
+                speak("Goodbye!")
                 break
 
-            ai_text = get_ai_response(user_text)
-            speak_text(ai_text)
+            ai_reply = get_ai_response(user_text)
+            print(f"🤖 AI: {ai_reply}")
+            speak(ai_reply)
 
         except KeyboardInterrupt:
             print("\n👋 Interrupted by user.")
@@ -128,6 +137,6 @@ def voice_chat_loop():
         except Exception as e:
             print(f"⚠ Error: {e}")
 
-# ------------------------------
+# -----------------------------
 if __name__ == "__main__":
-    voice_chat_loop()
+    voice_assistant()
