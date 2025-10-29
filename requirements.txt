@@ -5,3 +5,4 @@ pyttsx3
 openai
 transformers
 accelerate
+llama-cpp-python

@@ -4,85 +4,105 @@ import numpy as np
 import wave
 import pyttsx3
 from faster_whisper import WhisperModel
-from openai import OpenAI
 from collections import deque
-# -----------------------------------------------------------
-# 🔐 SET YOUR OPENAI API KEY HERE
-# -----------------------------------------------------------
-# ✅ REPLACE with your actual key (keep it private!)
-OPENAI_API_KEY = "sk-my api key"
+import time
 
-# Set it to environment variable (so OpenAI client can read it)
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-
-# Initialize OpenAI client
-client = OpenAI()
+# For LLaMA local inference
+try:
+    from llama_cpp import Llama
+except ImportError:
+    print("Installing llama-cpp-python...")
+    os.system("pip install llama-cpp-python")
+    from llama_cpp import Llama
 
 # ------------------------------
 # 🎤 Audio Settings
 # ------------------------------
-MIC_DEVICE_INDEX = 10  # ALC897 Analog mic
-audio_queue = deque()
+MIC_DEVICE_INDEX = 10  # Change to your mic index
+CHANNELS = 1
+SAMPLE_RATE = 44100
+AUDIO_QUEUE = deque()
+FILENAME = "input.wav"
+SILENCE_THRESHOLD = 500  # Adjust as needed
+SILENCE_DURATION = 5  # seconds to stop recording after silence
 
-# Query device info for correct sample rate
 device_info = sd.query_devices(MIC_DEVICE_INDEX, 'input')
 SAMPLE_RATE = int(device_info['default_samplerate'])
-CHANNELS = 1
-DURATION = 6  # seconds per recording
-FILENAME = "input.wav"
-
 print(f"🎤 Using device: {device_info['name']} ({MIC_DEVICE_INDEX}) at {SAMPLE_RATE} Hz")
 
 # ------------------------------
-# 🎙️ Record Audio
+# 🧠 Initialize Faster Whisper
 # ------------------------------
-def record_audio(filename=FILENAME, duration=DURATION):
-    print("🎙️ Speak now...")
-    audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=CHANNELS, dtype='int16', device=MIC_DEVICE_INDEX)
-    sd.wait()
+whisper_model = WhisperModel("medium.en", device="cuda")  # Or "cpu"
+
+def record_audio(filename=FILENAME, silence_duration=SILENCE_DURATION):
+    print("🎙️ Speak now... (5s silence will stop recording)")
+    buffer = []
+    start_time = time.time()
+    silence_start = None
+
+    def callback(indata, frames, time_info, status):
+        nonlocal silence_start
+        buffer.append(indata.copy())
+        volume_norm = np.linalg.norm(indata) * 10
+        if volume_norm < SILENCE_THRESHOLD:
+            if silence_start is None:
+                silence_start = time.time()
+        else:
+            silence_start = None
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                        dtype='int16', device=MIC_DEVICE_INDEX,
+                        callback=callback):
+        while True:
+            sd.sleep(100)
+            if silence_start and (time.time() - silence_start) > silence_duration:
+                break
+
+    audio = np.concatenate(buffer)
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio.tobytes())
+
     return filename
 
-# ------------------------------
-# 🧠 Speech-to-Text (Faster Whisper)
-# ------------------------------
 def transcribe_audio(filename):
     print("🔍 Transcribing...")
-    model = WhisperModel("medium", device="cuda")  # Use "cpu" if no GPU
-    segments, _ = model.transcribe(filename)
+    segments, _ = whisper_model.transcribe(filename)
     text = " ".join([seg.text for seg in segments]).strip()
     print(f"🗣️ You said: {text}")
     return text
 
 # ------------------------------
-# 🤖 GPT Response
+# 🤖 LLaMA Local Response
 # ------------------------------
-def get_ai_response(prompt):
-    if not os.getenv("OPENAI_API_KEY"):
-        print("❌ Missing OpenAI API Key.")
-        return "No API key configured."
+MODEL_PATH = "models/llama-2-7b-chat.Q4_K_M.gguf"
+if not os.path.exists(MODEL_PATH):
+    print("⬇ Downloading LLaMA 2 7B model locally...")
+    os.makedirs("models", exist_ok=True)
+    # Replace with correct GGUF URL
+    os.system(f"wget -O {MODEL_PATH} https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf")
 
-    print("🤖 Thinking...")
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    reply = response.choices[0].message.content.strip()
+llm = Llama(model_path=MODEL_PATH, n_threads=8)
+
+def get_ai_response(prompt):
+    print("🤖 Thinking locally with LLaMA...")
+    response = llm(prompt, max_tokens=256)
+    reply = response['choices'][0]['text'].strip()
     print(f"🤖 AI: {reply}")
     return reply
 
 # ------------------------------
 # 🔊 Text-to-Speech
 # ------------------------------
+tts_engine = pyttsx3.init()
+tts_engine.setProperty('rate', 180)
+
 def speak_text(text):
-    engine = pyttsx3.init()
-    engine.setProperty('rate', 180)
-    engine.say(text)
-    engine.runAndWait()
+    tts_engine.say(text)
+    tts_engine.runAndWait()
 
 # ------------------------------
 # 🔁 Main Voice Chat Loop
@@ -95,7 +115,6 @@ def voice_chat_loop():
             user_text = transcribe_audio(audio_file)
             if not user_text:
                 continue
-
             if "exit" in user_text.lower():
                 print("👋 Goodbye!")
                 break
