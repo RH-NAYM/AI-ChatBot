@@ -6,3 +6,5 @@ openai
 transformers
 accelerate
 llama-cpp-python
+TTS 
+soundfile
